@@ -1,0 +1,107 @@
+# Cross-dataset comparison: MMFlood-finetuned model evaluated on geoid-flood-heldout.
+seed_everything: 0
+trainer:
+  accelerator: auto
+  strategy: auto
+  devices: auto
+  num_nodes: 1
+  precision: bf16-mixed
+  logger:
+    class_path: TensorBoardLogger
+    init_args:
+      save_dir: workdir/cross_dataset/mmflood
+      name: finetune_terramind_base_unet_s1grd
+      version: v1_heldout
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 100
+
+  max_epochs: 1
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 100
+  enable_checkpointing: false
+  default_root_dir: workdir/cross_dataset/mmflood/finetune_terramind_base_unet_s1grd/v1_heldout/
+
+data:
+  class_path: geoid_flood.datamodules.geoid.GEOIDFloodDataModule
+  init_args:
+    root: data/geoid-flood-heldout
+    batch_size: 16
+    num_workers: 2
+    test_transform:
+      - class_path: albumentations.pytorch.ToTensorV2
+    drop_last: false
+    no_data_replace: 0.0
+    no_label_replace: 255
+    modalities:
+      - s1grd
+    image_scope:
+      - pre
+      - post
+    paired: true
+    output_bands:
+      - VV
+      - VH
+    means:
+      VV: -12.599
+      VH: -20.293
+    stds:
+      VV: 5.195
+      VH: 5.890
+    metadata_filename: data_tiles_s256_st128.csv
+    max_cloud_cover: 1
+    min_positive: 0.0
+    min_valid_proportion: 0.01
+    skip_bad_samples: true
+
+model:
+  class_path: terratorch.tasks.SemanticSegmentationTask
+  init_args:
+    model_factory: EncoderDecoderFactory
+    model_args:
+      backbone: terratorch_terramind_v1_base
+      backbone_pretrained: true
+      backbone_in_chans: 2
+      backbone_modalities:
+        - sen1grd
+      backbone_bands:
+        sen1grd:
+          - VV
+          - VH
+      necks:
+        - name: SelectIndices
+          indices: [2, 5, 8, 11]
+        - name: ReshapeTokensToImage
+          remove_cls_token: false
+        - name: LearnedInterpolateToPyramidal
+
+      decoder: UNetDecoder
+      decoder_channels: [512, 256, 128, 64]
+      num_classes: 2
+      head_dropout: 0.3
+    loss: ce
+    tiled_inference_parameters:
+      h_crop: 256
+      h_stride: 128
+      w_crop: 256
+      w_stride: 128
+      average_patches: true
+      verbose: true
+    ignore_index: 255
+    freeze_backbone: false
+    freeze_decoder: false
+    plot_on_val: false
+    tiled_inference_on_validation: false
+    tiled_inference_on_testing: false
+    optimizer: AdamW
+    lr: 5.e-5
+    optimizer_hparams:
+      weight_decay: 0.1
+    lr_overrides:
+      encoder: 5.e-6
+    scheduler: CosineAnnealingLR
+    scheduler_hparams:
+      T_max: 20
+      eta_min: 1e-6
+      last_epoch: -1

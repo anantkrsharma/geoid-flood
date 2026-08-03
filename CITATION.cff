@@ -1,0 +1,43 @@
+cff-version: 1.2.0
+message: "If you use this software or the GEOID-Flood benchmark, please cite the preferred citation below."
+type: software
+title: "GEOID-Flood: A Large-Scale Multi-Modal Benchmark Dataset for Flood Segmentation"
+version: 1.0.0
+license: MIT
+authors:
+  - given-names: Gaetano
+    family-names: Chiriaco
+    affiliation: "Fondazione LINKS, Torino, Italy"
+  - given-names: Luca
+    family-names: Barco
+    affiliation: "Fondazione LINKS, Torino, Italy"
+  - given-names: Claudio
+    family-names: Rossi
+    affiliation: "Fondazione LINKS, Torino, Italy"
+  - given-names: Andrea
+    family-names: Bragagnolo
+    affiliation: "Fondazione LINKS, Torino, Italy"
+  - given-names: Edoardo
+    family-names: Arnaudo
+    affiliation: "Fondazione LINKS, Torino, Italy"
+preferred-citation:
+  type: conference-paper
+  title: "GEOID-Flood: A Large-Scale Multi-Modal Benchmark Dataset for Flood Segmentation"
+  authors:
+    - given-names: Gaetano
+      family-names: Chiriaco
+      affiliation: "Fondazione LINKS, Torino, Italy"
+    - given-names: Luca
+      family-names: Barco
+      affiliation: "Fondazione LINKS, Torino, Italy"
+    - given-names: Claudio
+      family-names: Rossi
+      affiliation: "Fondazione LINKS, Torino, Italy"
+    - given-names: Andrea
+      family-names: Bragagnolo
+      affiliation: "Fondazione LINKS, Torino, Italy"
+    - given-names: Edoardo
+      family-names: Arnaudo
+      affiliation: "Fondazione LINKS, Torino, Italy"
+  collection-title: "ECCV 2026 Workshops (TerraBytes)"
+  year: 2026

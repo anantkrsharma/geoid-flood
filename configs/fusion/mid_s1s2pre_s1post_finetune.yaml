@@ -1,0 +1,207 @@
+seed_everything: 0
+trainer:
+  accelerator: auto
+  strategy: auto
+  devices: auto
+  num_nodes: 1
+  precision: bf16-mixed
+  logger:
+    class_path: TensorBoardLogger
+    init_args:
+      save_dir: workdir/fusion
+      name: finetune_terramind_base_unet_s1s2_midfusion_3class
+      version: v1
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: val/IoU_flood
+        mode: max
+        patience: 5
+        strict: true
+        verbose: true
+    - class_path: lightning.pytorch.callbacks.TQDMProgressBar
+      init_args:
+        refresh_rate: 100
+    - class_path: LearningRateMonitor
+      init_args:
+        logging_interval: epoch
+    - class_path: terratorch.cli_tools.StateDictAwareModelCheckpoint
+      init_args:
+        filename: best-{epoch}
+        monitor: val/IoU_flood
+        mode: max
+        save_top_k: 1
+        save_last: true
+    - class_path: terratorch.cli_tools.StateDictAwareModelCheckpoint
+      init_args:
+        filename: best-{epoch}_state_dict
+        monitor: val/IoU_flood
+        mode: max
+        save_top_k: 1
+        save_last: false
+        save_weights_only: true
+
+  max_epochs: 20
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 100
+  enable_checkpointing: true
+  default_root_dir: workdir/fusion/finetune_terramind_base_unet_s1s2_midfusion_3class/v1/
+
+data:
+  class_path: geoid_flood.datamodules.geoid.GEOIDFloodDataModule
+  init_args:
+    root: data/geoid-flood
+    batch_size: 16
+    num_workers: 0
+    train_transform:
+      - class_path: albumentations.D4
+      - class_path: albumentations.pytorch.ToTensorV2
+    val_transform:
+      - class_path: albumentations.pytorch.ToTensorV2
+    test_transform:
+      - class_path: albumentations.pytorch.ToTensorV2
+    predict_transform:
+      - class_path: albumentations.pytorch.ToTensorV2
+    drop_last: true
+    no_data_replace: 0.0
+    no_label_replace: 255
+    # Pre encoder ingests S2 + S1 (pre); post encoder ingests S1 (post).
+    # Fused channel order: [S2_pre(10) | S1_pre(2) | S1_post(2)] = 14.
+    modalities_pre:
+      - s2l2a
+      - s1grd
+    modalities_post:
+      - s1grd
+    image_scope:
+      - pre
+      - post
+    output_bands:
+      - BLUE
+      - GREEN
+      - RED
+      - RED_EDGE_1
+      - RED_EDGE_2
+      - RED_EDGE_3
+      - NIR_BROAD
+      - NIR_NARROW
+      - SWIR_1
+      - SWIR_2
+      - VV
+      - VH
+    means:
+      BLUE: 1924.863
+      GREEN: 2184.553
+      RED: 2340.936
+      RED_EDGE_1: 2671.402
+      RED_EDGE_2: 3240.082
+      RED_EDGE_3: 3468.412
+      NIR_BROAD: 3563.244
+      NIR_NARROW: 3627.704
+      SWIR_1: 3416.714
+      SWIR_2: 2849.625
+      VV: -12.599
+      VH: -20.293
+    stds:
+      BLUE: 1201.092
+      GREEN: 1219.943
+      RED: 1397.225
+      RED_EDGE_1: 1400.035
+      RED_EDGE_2: 1373.136
+      RED_EDGE_3: 1429.17
+      NIR_BROAD: 1485.025
+      NIR_NARROW: 1447.836
+      SWIR_1: 1471.002
+      SWIR_2: 1365.307
+      VV: 5.195
+      VH: 5.890
+    metadata_filename: data_tiles_s256_st128.csv
+    max_cloud_cover: 1
+    min_positive: 0.0
+    min_valid_proportion: 0.01
+    paired: true
+    fuse_paired: true
+
+model:
+  class_path: geoid_flood.tasks.flood_segmentation.FloodSegmentationTask
+  init_args:
+    model_factory: MidFusionEncoderDecoderFactory
+    model_args:
+      backbone: terratorch_terramind_v1_base
+      backbone_pretrained: true
+      # Pre branch: S2 (10) + S1 (2) = 12 channels.
+      backbone_in_chans: 12
+      backbone_modalities:
+        - sen1grd
+        - sen2l2a
+      backbone_merge_method: mean
+      backbone_bands:
+        sen1grd:
+          - VV
+          - VH
+        sen2l2a:
+          - BLUE
+          - GREEN
+          - RED
+          - RED_EDGE_1
+          - RED_EDGE_2
+          - RED_EDGE_3
+          - NIR_BROAD
+          - NIR_NARROW
+          - SWIR_1
+          - SWIR_2
+      fusion: diff
+      # Post branch: S1 only (2 channels).
+      post_overrides:
+        backbone_in_chans: 2
+        backbone_modalities:
+          - sen1grd
+        backbone_bands:
+          sen1grd:
+            - VV
+            - VH
+      # Slice the fused tensor into per-branch native modality dicts.
+      pre_modalities:
+        - [sen2l2a, 10]
+        - [sen1grd, 2]
+      post_modalities:
+        - [sen1grd, 2]
+      necks:
+        - name: SelectIndices
+          indices: [2, 5, 8, 11]
+        - name: ReshapeTokensToImage
+          remove_cls_token: false
+        - name: LearnedInterpolateToPyramidal
+
+      decoder: UNetDecoder
+      decoder_channels: [512, 256, 128, 64]
+      num_classes: 3
+      head_dropout: 0.3
+    loss: ce
+    class_names:
+      - background
+      - permanent_water
+      - flood
+    tiled_inference_parameters:
+      h_crop: 256
+      h_stride: 128
+      w_crop: 256
+      w_stride: 128
+      average_patches: true
+      verbose: true
+    ignore_index: 255
+    freeze_backbone: false
+    freeze_decoder: false
+    plot_on_val: false
+    tiled_inference_on_validation: false
+    tiled_inference_on_testing: false
+    optimizer: AdamW
+    lr: 5.e-5
+    optimizer_hparams:
+      weight_decay: 0.1
+    lr_overrides:
+      encoder: 5.e-6
+    scheduler: CosineAnnealingLR
+    scheduler_hparams:
+      T_max: 20
+      eta_min: 1e-6
+      last_epoch: -1
