@@ -4,7 +4,7 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2608.02315-b31b1b.svg)](https://arxiv.org/abs/2608.02315)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Data License: CC BY 4.0](https://img.shields.io/badge/Data%20License-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.11 | 3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/downloads/)
 
 GEOID-Flood is a large-scale, multi-modal benchmark for flood segmentation built from
 Copernicus Emergency Management Service (CEMS) Rapid Mapping activations. It spans 219 flood
@@ -34,16 +34,12 @@ Paper link: *to be added once on arxiv.*
 
 ## Installation
 
-Requires **Python >= 3.11**. `terratorch` is pinned to **`==1.1`**
+Requires **Python 3.11 or 3.12**. `terratorch` is pinned to **`==1.1`**
 
 ```bash
 git clone git@github.com:links-ads/geoid-flood && cd geoid-flood
-uv sync --extra scripts        # or: python -m venv .venv && .venv/bin/pip install -e ".[scripts]"
+uv sync --extra scripts        # or: python3.12 -m venv .venv && .venv/bin/pip install -e ".[scripts]"
 ```
-
-The `scripts` extra (pyyaml, tensorboard, torchmetrics, tqdm) is what the evaluation scripts
-under `scripts/` need. `terratorch` and its own dependencies (including PyTorch) install as
-core project dependencies either way.
 
 ## Dataset
 
@@ -55,11 +51,9 @@ AoIs share a split, so no flood event straddles train, validation and test.*
 The dataset is packaged as tar shards of Cloud-Optimized GeoTIFFs grouped by split
 and modality; the [dataset card](https://huggingface.co/datasets/links-ads/geoid-flood)
 documents every layer and the label encoding.
-[`scripts/get_data.py`](scripts/get_data.py) streams those shards straight into the layout the
-configs expect.
 
 ```bash
-pip install huggingface_hub        # or: uv sync --extra scripts
+uv sync --extra scripts
 
 # everything (~586 GB)
 python scripts/get_data.py --dest data
@@ -72,6 +66,9 @@ python scripts/get_data.py --dest data --tree geoid-flood-heldout --layer s1rtc 
 
 # preview a selection without downloading
 python scripts/get_data.py --list --layer s1grd s2l2a dem label
+
+# more shards in flight
+python scripts/get_data.py --dest data --layer s1grd --workers 8
 ```
 
 To inspect the data without a large download, `--sample` fetches two complete event-AoIs from

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "setuptools-scm"]
+requires = ["setuptools>=64,<83", "setuptools-scm>=8,<10"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -12,28 +12,27 @@ authors = [
 description = "GEOID-Flood: a large-scale multi-modal benchmark for flood segmentation"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "olmoearth-pretrain",
+    "olmoearth-pretrain>=0.1,<0.2",
     "terratorch==1.1",
 ]
 
-# Optional dependencies, use this to include everything that the project needs to run in development.
-# These can be installed by specifying for instance `pip install -e .[dev|docs|test]`
-# Here the loose versioning policy is usually preferred.
 [project.optional-dependencies]
 # Dependencies of the scripts under scripts/
 scripts = [
-    "huggingface_hub",
-    "pyarrow",
-    "pyyaml",
-    "tensorboard",
-    "torchmetrics",
-    "tqdm",
+    "huggingface_hub>=1.0,<2",
+    "pyarrow>=14,<23",
+    "pyyaml>=6,<7",
+    "tensorboard>=2.14,<3",
+    "torchmetrics>=1.4,<2",
+    "tqdm>=4.66,<5",
 ]
 
 [tool.setuptools]
@@ -52,4 +51,4 @@ profile = "black"
 src_paths = ["src", "tests"]
 
 [tool.uv.sources]
-olmoearth-pretrain = { git = "https://github.com/allenai/olmoearth_pretrain.git" }
+olmoearth-pretrain = { git = "https://github.com/allenai/olmoearth_pretrain.git", rev = "2c5c7a07883f3d834e5cdf2b8288ed2c52a78fa1" }

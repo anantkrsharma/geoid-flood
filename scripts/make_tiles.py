@@ -1,44 +1,3 @@
-"""Rebuild the chip inventory (`data_tiles_*.csv`) from a GEOID-Flood tree.
-
-The dataset ships `data_tiles_s256_st128.csv`, the exact inventory the published models were
-trained on: 256x256 chips at stride 128 for train and stride 256 (no overlap) for val/test.
-That file is one instantiation of a choice, not a property of the dataset -- the rasters
-themselves are 1024x1024. This script regenerates it at any tile size and stride, so a 224 or
-512 chip grid, or no tiling at all (`--no-tiling`, one row per 1024x1024 raster), needs no
-change to the loader: point `data.init_args.metadata_filename` at the new CSV.
-
-Which 1024x1024 tiles are inventoried comes from `tile_catalog.parquet`, selected by the paper's
-two criteria: `--valid-only` (`is_valid == True`, on by default) and `--max-invalid-frac` (keep
-`invalid_pixel_frac <= 0.95`). With the defaults, the selection is exactly the tile inventory the
-paper reports -- 12,853 tiles for `geoid-flood` (8,938 train / 1,241 val / 2,674 test) and 1,429
-for `geoid-flood-heldout`. Pass `--no-valid-only` and `--max-invalid-frac 1.0` to visit every tile
-in the catalog. `split` and `event_date` are read from the same table, so a regenerated CSV
-inherits the published split assignment unchanged.
-
-Per-chip statistics are computed from the label raster exactly as the original tiler computed
-them: `valid_proportion` (fraction of pixels != 255), `positive_proportion` (fraction of pixels
-in {1, 2}), and, for `s2l2a` only, `cloud_cover` from the matching `cloudmask` raster.
-`min_valid_proportion` in the datamodule filters on `valid_proportion`, so re-tiling at a
-different size changes which chips survive that filter -- expect different row counts.
-
-Examples:
-    # the paper's tile selection, at the shipped 256/128 chip grid
-    python scripts/make_tiles.py --data-root data/geoid-flood
-
-    # every tile in the catalog, no selection criteria
-    python scripts/make_tiles.py --data-root data/geoid-flood --no-valid-only --max-invalid-frac 1.0
-
-    # 512x512 chips, stride 256 on train
-    python scripts/make_tiles.py --data-root data/geoid-flood --tile-size 512 --stride 256
-
-    # no tiling: one row per 1024x1024 raster per modality
-    python scripts/make_tiles.py --data-root data/geoid-flood --no-tiling
-
-    # S1-GRD only, one event, to a chosen path
-    python scripts/make_tiles.py --data-root data/geoid-flood --modality s1grd \
-        --event EMSR332 --output /tmp/emsr332.csv
-"""
-
 import argparse
 import csv
 import logging
@@ -54,7 +13,7 @@ from rasterio.windows import Window
 
 try:
     from tqdm import tqdm
-except ImportError:  # keeps the script runnable straight from the dataset tree
+except ImportError:
 
     def tqdm(iterable, **_):
         return iterable

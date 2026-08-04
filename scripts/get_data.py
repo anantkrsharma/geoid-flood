@@ -6,34 +6,26 @@ import gzip
 import hashlib
 import json
 import re
+import shutil
+import sys
 import tarfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download, hf_hub_url
-from huggingface_hub.utils import get_session
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import disable_progress_bars
+from tqdm import tqdm
 
 REPO = "links-ads/geoid-flood"
 TREES = ("geoid-flood", "geoid-flood-heldout")
 LAYERS = ("s1grd", "s1rtc", "s2l2a", "dem", "label", "cloudmask", "floodmask", "permwater", "validity")
 SPLITS = ("train", "val", "test")
 METADATA = ("data_tiles_s256_st128.csv", "tile_catalog.parquet")
+STAGING = ".geoid_flood_staging"
+STATE = ".geoid_flood_done"
 
 SHARD_RE = re.compile(r"^(?P<tree>[^/]+)/shards/(?P<split>[^/]+)/(?P<layer>[^/]+)/[^/]+\.tar$")
-
-
-class _Counting:
-    """Wraps a stream so we can sha256 and count bytes as tarfile pulls from it."""
-
-    def __init__(self, raw):
-        self.raw = raw
-        self.h = hashlib.sha256()
-        self.n = 0
-
-    def read(self, size=-1):
-        chunk = self.raw.read(size)
-        self.h.update(chunk)
-        self.n += len(chunk)
-        return chunk
 
 
 def _safe_members(tar, root: Path):
@@ -47,53 +39,59 @@ def _safe_members(tar, root: Path):
         yield info, dest
 
 
-def stream_shard(repo: str, path: str, dest_root: Path, expect_sha: str | None, token: str | None) -> int:
-    """Stream one shard from the Hub straight into dest_root. Returns bytes transferred."""
-    url = hf_hub_url(repo_id=repo, filename=path, repo_type="dataset")
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    resp = get_session().get(url, stream=True, headers=headers, timeout=60)
-    resp.raise_for_status()
-    counter = _Counting(resp.raw)
-    tree = path.split("/", 1)[0]
-    out_root = dest_root / tree
-    with tarfile.open(fileobj=counter, mode="r|") as tar:
+def select_shards(index: dict, trees, splits, layers) -> list[dict]:
+    out = []
+    for shard in index["shards"]:
+        m = SHARD_RE.match(shard["path"])
+        if m and m["tree"] in trees and m["split"] in splits and m["layer"] in layers:
+            out.append(shard)
+    return out
+
+
+def fetch_shard(repo: str, path: str, staging: Path, token: str | None) -> Path:
+    """Pull one shard to staging over the Xet chunk protocol."""
+    return Path(hf_hub_download(repo_id=repo, filename=path, repo_type="dataset",
+                                local_dir=str(staging), token=token))
+
+
+def verify_shard(tar_path: Path, expect_sha: str | None) -> None:
+    if not expect_sha:
+        return
+    h = hashlib.sha256()
+    with open(tar_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != expect_sha:
+        raise ValueError(f"sha256 mismatch for {tar_path.name}")
+
+
+def unpack_shard(tar_path: Path, out_root: Path) -> None:
+    """Extract a staged shard into out_root. Writes via .part so a kill leaves no half files."""
+    with tarfile.open(tar_path, mode="r") as tar:
         for info, dest in _safe_members(tar, out_root):
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_suffix(dest.suffix + ".part")
-            src = tar.extractfile(info)
-            with open(tmp, "wb") as fh:
-                while True:
-                    chunk = src.read(1 << 20)
-                    if not chunk:
-                        break
-                    fh.write(chunk)
+            with tar.extractfile(info) as src, open(tmp, "wb") as fh:
+                shutil.copyfileobj(src, fh, 1 << 20)
             tmp.replace(dest)
-    # Drain any trailing padding so the hash covers the whole object.
-    while True:
-        if not counter.read(1 << 20):
-            break
-    if expect_sha and counter.h.hexdigest() != expect_sha:
-        raise ValueError(f"sha256 mismatch for {path}")
-    return counter.n
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Download GEOID-Flood from the Hugging Face Hub and unpack it to the "
-                    "canonical layout. Shards are streamed straight into the output tree, so "
-                    "peak disk usage equals the final dataset size. Re-running resumes. "
-                    "--sample is the exception: it downloads via the Hub cache and then copies "
-                    "into --dest, so it needs roughly twice the sample size while it runs."
+        description="Download GEOID-Flood from the Hugging Face Hub and unpack it to the expected layout"
     )
     ap.add_argument("--repo", default=REPO)
     ap.add_argument("--dest", default="data", type=Path, help="parent dir; trees are created under it")
     ap.add_argument("--tree", nargs="+", choices=TREES, default=list(TREES))
     ap.add_argument("--split", nargs="+", choices=SPLITS, default=list(SPLITS))
     ap.add_argument("--layer", nargs="+", choices=LAYERS, default=list(LAYERS))
+    ap.add_argument("--workers", type=int, default=4,
+                    help="shards fetched and unpacked concurrently (default 4); raises peak disk")
+    ap.add_argument("--force", action="store_true", help="skip the free-space preflight check")
     ap.add_argument("--list", action="store_true", help="print the selection and exit")
     ap.add_argument("--sample", action="store_true",
                     help="fetch only the two-AoI EMSR712 sample: 47 tiles, all nine layers, "
-                         "~2.9 GB (needs ~5.8 GB free, see below) and exit")
+                         "~2.9 GB, and exit")
     ap.add_argument("--token", default=None)
     args = ap.parse_args()
 
@@ -103,11 +101,12 @@ def main() -> None:
         tmp = snapshot_download(
             repo_id=args.repo, repo_type="dataset", allow_patterns=["sample/*"], token=args.token
         )
-        for src in (Path(tmp) / "sample").rglob("*"):
+        root = Path(tmp) / "sample"
+        for src in root.rglob("*"):
             if src.is_file():
-                dst = args.dest / src.relative_to(Path(tmp) / "sample")
+                dst = args.dest / src.relative_to(root)
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_bytes(src.read_bytes())
+                shutil.move(str(src), dst)
         print(f"sample -> {args.dest}/geoid-flood/")
         print("run a config against it with:")
         print("  --data.init_args.metadata_filename data_tiles_s256_st128_sample.csv")
@@ -119,12 +118,7 @@ def main() -> None:
     with gzip.open(index_path, "rt") as fh:
         index = json.load(fh)
 
-    selected = []
-    for shard in index["shards"]:
-        m = SHARD_RE.match(shard["path"])
-        if m and m["tree"] in args.tree and m["split"] in args.split and m["layer"] in args.layer:
-            selected.append(shard)
-
+    selected = select_shards(index, args.tree, args.split, args.layer)
     total = sum(s["size"] for s in selected)
     print(f"{len(selected)} shards, {total/1e9:.1f} GB")
     if args.list:
@@ -140,6 +134,19 @@ def main() -> None:
         return
 
     args.dest.mkdir(parents=True, exist_ok=True)
+    state = args.dest / STATE
+    done = set(state.read_text().split()) if state.exists() else set()
+    todo = [s for s in selected if s["path"] not in done]
+    remaining = sum(s["size"] for s in todo)
+
+    if todo:
+        need = remaining + args.workers * max(s["size"] for s in todo)
+        free = shutil.disk_usage(args.dest).free
+        if free < need and not args.force:
+            sys.exit(f"not enough space at {args.dest}: {free/1e9:.1f} GB free, "
+                     f"need ~{need/1e9:.1f} GB ({remaining/1e9:.1f} GB of data plus staging). "
+                     f"Narrow the selection with --layer/--split/--tree, or pass --force.")
+
     for tree in args.tree:
         for name in METADATA:
             p = hf_hub_download(
@@ -148,22 +155,92 @@ def main() -> None:
             )
             print(f"metadata {p}")
 
-    state = args.dest / ".geoid_flood_done"
-    done = set(state.read_text().split()) if state.exists() else set()
+    staging = args.dest / STAGING
+    shutil.rmtree(staging, ignore_errors=True)  # a killed run leaves tars behind
+    staging.mkdir(parents=True)
 
-    got = 0
-    for i, shard in enumerate(selected, 1):
-        if shard["path"] in done:
-            got += shard["size"]
-            continue
-        n = stream_shard(args.repo, shard["path"], args.dest, shard.get("sha256"), args.token)
-        got += n
-        with state.open("a") as fh:
+
+    disable_progress_bars()
+    lock = threading.Lock()
+    failures: list[tuple[str, str]] = []
+    n_done = len(selected) - len(todo)
+    done_bytes = 0
+    stop = threading.Event()
+
+    def staged_bytes() -> int:
+        n = 0
+        for p in staging.rglob("*"):  # the in-flight tars plus the .incomplete parts under them
+            if p.is_file():
+                try:
+                    n += p.stat().st_size
+                except OSError:  # unlinked between walk and stat
+                    pass
+        return n
+
+    def monitor() -> None:
+        reported = 0
+        while not stop.is_set():
+            with lock:
+                target = done_bytes + staged_bytes()
+                if target > reported:
+                    bar.update(target - reported)
+                    reported = target
+            stop.wait(0.5)
+
+    def run(shard: dict) -> None:
+        nonlocal n_done, done_bytes
+        tar = fetch_shard(args.repo, shard["path"], staging, args.token)
+        try:
+            verify_shard(tar, shard.get("sha256"))
+            unpack_shard(tar, args.dest / shard["path"].split("/", 1)[0])
+        except BaseException:
+            tar.unlink(missing_ok=True)
+            raise
+        with lock:
+            done_bytes += shard["size"]
+            tar.unlink(missing_ok=True)
             fh.write(shard["path"] + "\n")
-        print(f"[{i}/{len(selected)}] {shard['path']}  {got/1e9:.1f}/{total/1e9:.1f} GB", flush=True)
+            fh.flush()
+            n_done += 1
+            bar.set_description_str(f"{n_done}/{len(selected)} shards", refresh=False)
+
+    def guarded(shard: dict) -> None:
+        for attempt in (1, 2):
+            try:
+                run(shard)
+                return
+            except Exception as exc:
+                if attempt == 2:
+                    with lock:
+                        failures.append((shard["path"], f"{type(exc).__name__}: {exc}"))
+
+    with state.open("a") as fh, \
+            tqdm(total=total, initial=total - remaining, unit="B", unit_scale=True,
+                 unit_divisor=1000, smoothing=0.05,
+                 desc=f"{n_done}/{len(selected)} shards") as bar, \
+            ThreadPoolExecutor(max_workers=args.workers) as pool:
+        watcher = threading.Thread(target=monitor, daemon=True)
+        watcher.start()
+        try:
+            list(pool.map(guarded, todo))
+        finally:
+            stop.set()
+            watcher.join()
+
+    shutil.rmtree(staging, ignore_errors=True)
+
+    if failures:
+        print(f"\n{len(failures)} shard(s) failed; re-run to retry them:", file=sys.stderr)
+        for path, err in failures:
+            print(f"  {path}: {err}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"\ndone -> {args.dest}/")
-    print("configs expect data/geoid-flood and data/geoid-flood-heldout; symlink if --dest differs.")
+    expected = Path("data").resolve()
+    if args.dest.resolve() != expected:
+        print("configs read data/geoid-flood; link the trees with:")
+        for tree in args.tree:
+            print(f"  ln -s {args.dest.resolve()}/{tree} data/{tree}")
 
 
 if __name__ == "__main__":

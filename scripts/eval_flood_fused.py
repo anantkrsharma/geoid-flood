@@ -32,9 +32,6 @@ import yaml
 from torchmetrics.classification import MulticlassF1Score, MulticlassJaccardIndex
 from tqdm import tqdm
 
-# scripts/ is not a package; add it to sys.path so we can reuse the paired-eval helpers.
-# Importing the module only runs its top-level defs + logging.basicConfig (its CLI is guarded by
-# ``if __name__ == "__main__":``), so main() does not fire on import.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_flood_paired import (  # noqa: E402
     _checkpoint_global_step,
