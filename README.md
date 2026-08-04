@@ -2,7 +2,7 @@
 
 [![HF Dataset](https://img.shields.io/badge/🤗%20Dataset-links--ads%2Fgeoid--flood-yellow)](https://huggingface.co/datasets/links-ads/geoid-flood)
 [![arXiv](https://img.shields.io/badge/arXiv-2608.02315-b31b1b.svg)](https://arxiv.org/abs/2608.02315)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Data License: CC BY 4.0](https://img.shields.io/badge/Data%20License-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 [![Python 3.11 | 3.12](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue.svg)](https://www.python.org/downloads/)
 
