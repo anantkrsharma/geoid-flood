@@ -24,14 +24,6 @@ value, is on the Hugging Face Hub at
 *Three GEOID-Flood events, all layers of a tile side by side. Flooded water is cyan, permanent
 water blue, invalid pixels gray.*
 
-## Paper
-
-**GEOID-Flood: A Large-Scale Multi-Modal Benchmark Dataset for Flood Segmentation**
-Gaetano Chiriaco, Luca Barco, Claudio Rossi, Andrea Bragagnolo, Edoardo Arnaudo
-Fondazione LINKS, Torino, Italy
-ECCV 2026 TerraBytes Workshop.
-Paper link: *to be added once on arxiv.*
-
 ## Installation
 
 Requires **Python 3.11 or 3.12**. `terratorch` is pinned to **`==1.1`**
