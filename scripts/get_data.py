@@ -5,17 +5,26 @@ import argparse
 import gzip
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
 import tarfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
-from huggingface_hub.utils import disable_progress_bars
 from tqdm import tqdm
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    # The downloader also works with variables set in the calling shell.  Do
+    # not make an optional .env convenience a hard runtime dependency.
+    pass
+else:
+    load_dotenv()
 
 REPO = "links-ads/geoid-flood"
 TREES = ("geoid-flood", "geoid-flood-heldout")
@@ -34,7 +43,9 @@ def _safe_members(tar, root: Path):
         if not info.isreg():
             raise ValueError(f"unexpected member type in shard: {info.name}")
         dest = (root / info.name).resolve()
-        if not str(dest).startswith(str(root) + "/"):
+        try:
+            dest.relative_to(root)
+        except ValueError:
             raise ValueError(f"member escapes destination: {info.name}")
         yield info, dest
 
@@ -48,7 +59,15 @@ def select_shards(index: dict, trees, splits, layers) -> list[dict]:
     return out
 
 
-def fetch_shard(repo: str, path: str, staging: Path, token: str | None) -> Path:
+def get_hf_client():
+    """Import only after command-line Hugging Face settings are in the environment."""
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import disable_progress_bars
+
+    return hf_hub_download, disable_progress_bars
+
+
+def fetch_shard(hf_hub_download, repo: str, path: str, staging: Path, token: str | None) -> Path:
     """Pull one shard to staging over the Xet chunk protocol."""
     return Path(hf_hub_download(repo_id=repo, filename=path, repo_type="dataset",
                                 local_dir=str(staging), token=token))
@@ -86,7 +105,15 @@ def main() -> None:
     ap.add_argument("--split", nargs="+", choices=SPLITS, default=list(SPLITS))
     ap.add_argument("--layer", nargs="+", choices=LAYERS, default=list(LAYERS))
     ap.add_argument("--workers", type=int, default=4,
-                    help="shards fetched and unpacked concurrently (default 4); raises peak disk")
+                    help="shards downloaded concurrently (default 4); raises peak disk use")
+    ap.add_argument("--extract-workers", type=int, default=None,
+                    help="shards extracted concurrently (default: min(2, --workers))")
+    ap.add_argument("--xet-high-performance", action="store_true",
+                    help="enable HF_XET_HIGH_PERFORMANCE (best with >=64 GB RAM and an SSD/NVMe)")
+    ap.add_argument("--xet-download-concurrency", type=int, metavar="N",
+                    help="set HF_XET_FIXED_DOWNLOAD_CONCURRENCY to N range requests")
+    ap.add_argument("--xet-sequential-writes", action="store_true",
+                    help="write Xet reconstruction data sequentially; useful for spinning disks")
     ap.add_argument("--force", action="store_true", help="skip the free-space preflight check")
     ap.add_argument("--list", action="store_true", help="print the selection and exit")
     ap.add_argument("--sample", action="store_true",
@@ -94,6 +121,23 @@ def main() -> None:
                          "~2.9 GB, and exit")
     ap.add_argument("--token", default=None)
     args = ap.parse_args()
+
+    if args.workers < 1:
+        ap.error("--workers must be at least 1")
+    if args.extract_workers is None:
+        args.extract_workers = min(2, args.workers)
+    elif args.extract_workers < 1:
+        ap.error("--extract-workers must be at least 1")
+    if args.xet_download_concurrency is not None:
+        if args.xet_download_concurrency < 1:
+            ap.error("--xet-download-concurrency must be at least 1")
+        os.environ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = str(args.xet_download_concurrency)
+    if args.xet_high_performance:
+        os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+    if args.xet_sequential_writes:
+        os.environ["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = "1"
+
+    hf_hub_download, disable_progress_bars = get_hf_client()
 
     if args.sample:
         from huggingface_hub import snapshot_download
@@ -140,7 +184,8 @@ def main() -> None:
     remaining = sum(s["size"] for s in todo)
 
     if todo:
-        need = remaining + args.workers * max(s["size"] for s in todo)
+        staging_slots = args.workers + args.extract_workers
+        need = remaining + staging_slots * max(s["size"] for s in todo)
         free = shutil.disk_usage(args.dest).free
         if free < need and not args.force:
             sys.exit(f"not enough space at {args.dest}: {free/1e9:.1f} GB free, "
@@ -187,15 +232,22 @@ def main() -> None:
                     reported = target
             stop.wait(0.5)
 
-    def run(shard: dict) -> None:
-        nonlocal n_done, done_bytes
-        tar = fetch_shard(args.repo, shard["path"], staging, args.token)
+    def download_shard(shard: dict) -> Path:
+        """Download and checksum a shard before it is eligible for extraction."""
+        tar = fetch_shard(hf_hub_download, args.repo, shard["path"], staging, args.token)
         try:
             verify_shard(tar, shard.get("sha256"))
-            unpack_shard(tar, args.dest / shard["path"].split("/", 1)[0])
         except BaseException:
             tar.unlink(missing_ok=True)
             raise
+        return tar
+
+    def extract_shard(shard: dict, tar: Path) -> None:
+        """Extract only a verified shard; individual files remain atomic via .part."""
+        unpack_shard(tar, args.dest / shard["path"].split("/", 1)[0])
+
+    def mark_complete(shard: dict, tar: Path) -> None:
+        nonlocal n_done, done_bytes
         with lock:
             done_bytes += shard["size"]
             tar.unlink(missing_ok=True)
@@ -204,25 +256,90 @@ def main() -> None:
             n_done += 1
             bar.set_description_str(f"{n_done}/{len(selected)} shards", refresh=False)
 
-    def guarded(shard: dict) -> None:
-        for attempt in (1, 2):
-            try:
-                run(shard)
-                return
-            except Exception as exc:
-                if attempt == 2:
-                    with lock:
-                        failures.append((shard["path"], f"{type(exc).__name__}: {exc}"))
-
     with state.open("a") as fh, \
             tqdm(total=total, initial=total - remaining, unit="B", unit_scale=True,
                  unit_divisor=1000, smoothing=0.05,
                  desc=f"{n_done}/{len(selected)} shards") as bar, \
-            ThreadPoolExecutor(max_workers=args.workers) as pool:
+            ThreadPoolExecutor(max_workers=args.workers) as download_pool, \
+            ThreadPoolExecutor(max_workers=args.extract_workers) as extract_pool:
         watcher = threading.Thread(target=monitor, daemon=True)
         watcher.start()
         try:
-            list(pool.map(guarded, todo))
+            # Keep a bounded pipeline: at most --workers tars are downloading
+            # and at most --extract-workers verified tars are being unpacked.
+            # This leaves the network active while earlier shards are written.
+            pending_downloads: dict[Future, dict] = {}
+            pending_extractions: dict[Future, tuple[dict, Path]] = {}
+            ready_to_extract: deque[tuple[dict, Path]] = deque()
+            retry_queue: deque[dict] = deque()
+            shard_iter = iter(todo)
+            attempts: dict[str, int] = {}
+
+            def submit_download(shard: dict) -> None:
+                attempts[shard["path"]] = attempts.get(shard["path"], 0) + 1
+                pending_downloads[download_pool.submit(download_shard, shard)] = shard
+
+            def retry_or_record(shard: dict, exc: Exception) -> None:
+                if attempts[shard["path"]] < 2:
+                    retry_queue.append(shard)
+                else:
+                    failures.append((shard["path"], f"{type(exc).__name__}: {exc}"))
+
+            def fill_download_slots() -> bool:
+                submitted = False
+                while len(pending_downloads) < args.workers:
+                    if retry_queue:
+                        shard = retry_queue.popleft()
+                    else:
+                        try:
+                            shard = next(shard_iter)
+                        except StopIteration:
+                            break
+                    submit_download(shard)
+                    submitted = True
+                return submitted
+
+            fill_download_slots()
+            while pending_downloads or pending_extractions or ready_to_extract or retry_queue:
+                progressed = False
+
+                for future, shard in list(pending_downloads.items()):
+                    if not future.done():
+                        continue
+                    del pending_downloads[future]
+                    try:
+                        ready_to_extract.append((shard, future.result()))
+                    except Exception as exc:
+                        retry_or_record(shard, exc)
+                    progressed = True
+
+                for future, (shard, tar) in list(pending_extractions.items()):
+                    if not future.done():
+                        continue
+                    del pending_extractions[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        tar.unlink(missing_ok=True)
+                        retry_or_record(shard, exc)
+                    else:
+                        mark_complete(shard, tar)
+                    progressed = True
+
+                while ready_to_extract and len(pending_extractions) < args.extract_workers:
+                    shard, tar = ready_to_extract.popleft()
+                    future = extract_pool.submit(extract_shard, shard, tar)
+                    pending_extractions[future] = (shard, tar)
+                    progressed = True
+
+                if fill_download_slots():
+                    progressed = True
+                if progressed:
+                    continue
+
+                active = set(pending_downloads) | set(pending_extractions)
+                if active:
+                    wait(active, return_when=FIRST_COMPLETED)
         finally:
             stop.set()
             watcher.join()
