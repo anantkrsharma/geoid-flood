@@ -5,7 +5,6 @@ import argparse
 import gzip
 import hashlib
 import json
-import os
 import re
 import shutil
 import sys
@@ -15,6 +14,8 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import disable_progress_bars
 from tqdm import tqdm
 
 try:
@@ -59,15 +60,7 @@ def select_shards(index: dict, trees, splits, layers) -> list[dict]:
     return out
 
 
-def get_hf_client():
-    """Import only after command-line Hugging Face settings are in the environment."""
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.utils import disable_progress_bars
-
-    return hf_hub_download, disable_progress_bars
-
-
-def fetch_shard(hf_hub_download, repo: str, path: str, staging: Path, token: str | None) -> Path:
+def fetch_shard(repo: str, path: str, staging: Path, token: str | None) -> Path:
     """Pull one shard to staging over the Xet chunk protocol."""
     return Path(hf_hub_download(repo_id=repo, filename=path, repo_type="dataset",
                                 local_dir=str(staging), token=token))
@@ -107,13 +100,7 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=4,
                     help="shards downloaded concurrently (default 4); raises peak disk use")
     ap.add_argument("--extract-workers", type=int, default=None,
-                    help="shards extracted concurrently (default: min(2, --workers))")
-    ap.add_argument("--xet-high-performance", action="store_true",
-                    help="enable HF_XET_HIGH_PERFORMANCE (best with >=64 GB RAM and an SSD/NVMe)")
-    ap.add_argument("--xet-download-concurrency", type=int, metavar="N",
-                    help="set HF_XET_FIXED_DOWNLOAD_CONCURRENCY to N range requests")
-    ap.add_argument("--xet-sequential-writes", action="store_true",
-                    help="write Xet reconstruction data sequentially; useful for spinning disks")
+                    help="shards extracted concurrently (default: same as --workers)")
     ap.add_argument("--force", action="store_true", help="skip the free-space preflight check")
     ap.add_argument("--list", action="store_true", help="print the selection and exit")
     ap.add_argument("--sample", action="store_true",
@@ -125,19 +112,9 @@ def main() -> None:
     if args.workers < 1:
         ap.error("--workers must be at least 1")
     if args.extract_workers is None:
-        args.extract_workers = min(2, args.workers)
+        args.extract_workers = args.workers
     elif args.extract_workers < 1:
         ap.error("--extract-workers must be at least 1")
-    if args.xet_download_concurrency is not None:
-        if args.xet_download_concurrency < 1:
-            ap.error("--xet-download-concurrency must be at least 1")
-        os.environ["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = str(args.xet_download_concurrency)
-    if args.xet_high_performance:
-        os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
-    if args.xet_sequential_writes:
-        os.environ["HF_XET_RECONSTRUCT_WRITE_SEQUENTIALLY"] = "1"
-
-    hf_hub_download, disable_progress_bars = get_hf_client()
 
     if args.sample:
         from huggingface_hub import snapshot_download
@@ -234,7 +211,7 @@ def main() -> None:
 
     def download_shard(shard: dict) -> Path:
         """Download and checksum a shard before it is eligible for extraction."""
-        tar = fetch_shard(hf_hub_download, args.repo, shard["path"], staging, args.token)
+        tar = fetch_shard(args.repo, shard["path"], staging, args.token)
         try:
             verify_shard(tar, shard.get("sha256"))
         except BaseException:
@@ -286,8 +263,13 @@ def main() -> None:
                     failures.append((shard["path"], f"{type(exc).__name__}: {exc}"))
 
             def fill_download_slots() -> bool:
+                # Tars live in staging until extraction finishes, so cap the
+                # whole pipeline at what the free-space preflight reserved.
+                slots = args.workers + args.extract_workers
                 submitted = False
-                while len(pending_downloads) < args.workers:
+                while (len(pending_downloads) < args.workers
+                       and len(pending_downloads) + len(ready_to_extract)
+                       + len(pending_extractions) < slots):
                     if retry_queue:
                         shard = retry_queue.popleft()
                     else:
